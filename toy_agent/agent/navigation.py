@@ -1,0 +1,923 @@
+"""FPS policy: coordinated defaults, tactical objectives, and public-map navigation.
+
+Coordination is deterministic, not a messaging or shared-memory system.
+All timing and tactical thresholds are heuristics to validate in real matches.
+"""
+import math
+import gc
+import heapq
+
+
+def clip(value):
+    return max(-1.0, min(1.0, value))
+
+
+def distance(a, b):
+    return math.sqrt(sum((x - y)**2 for x, y in zip(a, b)))
+
+
+def angle(value):
+    return (value + math.pi) % (2 * math.pi) - math.pi
+
+
+class Player:
+    def __init__(self):
+        self.nodes, self.edges, self.sites = {}, {}, []
+        self.pending_map = None
+        self.path, self.goal = [], None
+        self.round = None
+        self.last_position, self.stuck = None, 0
+        self.anchor, self.anchor_tick = None, 0
+        self.escape_until, self.escape_yaw, self.escapes = 0, 0.0, 0
+        self.last_seen_enemy, self.last_seen_tick = None, -10000
+        self.path_risk_stamp = None
+        self.buy_round, self.buy_mode = None, None
+        self.buy_primary = None
+        self.sound_yaw, self.sound_tick = None, -10000
+        self.cover_boxes, self.cover_cache = [], {}
+        self.flash_buy_round, self.flash_used_round = None, None
+        self.flash_primed_tick = None
+        self.cover_grid, self.spawn_points, self.landmarks = {}, {}, {}
+        self.peek_until, self.peek_target, self.peeked = 0, None, None
+        self.last_hp, self.team_alive = None, {}
+        self.alert_until, self.alert_cover = 0, None
+        self.zone_pattern, self.zone_since = None, 0
+        self.peek_start, self.peek_heading, self.peek_cooldown = 0, 0.0, -10000
+        self.utility_kind, self.smoke_buy_round = None, None
+        self.blocked_point, self.blocked_until = None, 0
+        self.postplant_goal, self.postplant_since = None, 0
+        self.flash_turn_until, self.flash_away_yaw = 0, 0.0
+        self.escort_goal, self.escort_tick = None, -10000
+        self.defense_candidate, self.defense_since = None, 0
+        self.he_buy_round = None
+
+    def load_map(self, row):
+        self.sites = row["sites"]
+        self.cover_boxes = row.get("boxes", []) if isinstance(row.get("boxes", []), list) else []
+        self.cover_cache = {}
+        self.spawn_points = row.get("spawn_pads_by_side", {}) or {}
+        self.landmarks = row.get("route_landmarks", {}) or {}
+        self.cover_grid = {}
+        # Bucket compact box geometry once; avoid expensive whole-map scans per path.
+        for b in self.cover_boxes:
+            if not isinstance(b, dict) or not all(isinstance(b.get(k), (int, float)) and math.isfinite(b[k]) for k in ("x", "y", "z", "w", "d", "h")):
+                continue
+            if b["w"] <= 0 or b["d"] <= 0 or b["w"] > 80 or b["d"] > 80 or b["h"] < 1:
+                continue
+            x0, x1 = math.floor((b["x"] - b["w"]/2 - 3)/12), math.floor((b["x"] + b["w"]/2 + 3)/12)
+            y0, y1 = math.floor((b["y"] - b["d"]/2 - 3)/12), math.floor((b["y"] + b["d"]/2 + 3)/12)
+            for x in range(x0, x1 + 1):
+                for y in range(y0, y1 + 1):
+                    self.cover_grid.setdefault((x, y), []).append(b)
+        self.nodes = {n["id"]: n["position"]
+                      for n in row["nav"]["nodes"]}
+        self.edges = {key: [] for key in self.nodes}
+        for edge in row["nav"]["edges"]:
+            if edge["kind"] != "ladder":
+                self.edges[edge["from"]].append(edge["to"])
+                if edge["kind"] == "walk":
+                    self.edges[edge["to"]].append(edge["from"])
+
+    def near_cover(self, point):
+        """Approximate cover from nearby compatible-height box outlines."""
+        for b in self.cover_grid.get((math.floor(point[0]/12), math.floor(point[1]/12)), ()):
+            if not (b["z"] <= point[2]+0.7 and b["z"]+b["h"] >= point[2]+1):
+                continue
+            dx = max(abs(point[0]-b["x"])-b["w"]/2, 0)
+            dy = max(abs(point[1]-b["y"])-b["d"]/2, 0)
+            gap = math.hypot(dx, dy)
+            if 0.4 <= gap <= 3:
+                return True
+        return False
+
+    def cover_toward(self, point, threat):
+        """Approximate whether a nearby box lies between point and threat."""
+        vx, vy = threat[0]-point[0], threat[1]-point[1]
+        dist = math.hypot(vx, vy)
+        if dist < 0.01:
+            return False
+        for b in self.cover_grid.get((math.floor(point[0]/12), math.floor(point[1]/12)), ()):
+            if not (b["z"] <= point[2]+0.7 and b["z"]+b["h"] >= point[2]+1):
+                continue
+            dx, dy = b["x"]-point[0], b["y"]-point[1]
+            forward = (dx*vx+dy*vy)/dist
+            lateral = abs(dx*vy-dy*vx)/dist
+            gap = math.hypot(max(abs(dx)-b["w"]/2,0), max(abs(dy)-b["d"]/2,0))
+            if 0.4 <= gap <= 3 and 0 < forward < dist and lateral <= math.hypot(b["w"],b["d"])/2:
+                return True
+        return False
+
+    def nearby_cover(self, pos, threat=None):
+        """Choose an existing nearby waypoint; no synthetic free-space claims."""
+        best, best_score = None, float("inf")
+        for point in self.nodes.values():
+            d = math.dist(pos[:2],point[:2])
+            if not 1.5 <= d <= 12 or abs(pos[2]-point[2]) > 2.5:
+                continue
+            if not self.near_cover(point):
+                continue
+            score = d + (3 if threat is not None and not self.cover_toward(point, threat) else 0)
+            if score < best_score:
+                best, best_score = list(point), score
+        return best
+
+    def update_alert(self, o):
+        """Only own HP and observed teammate alive flags, no replay-only data."""
+        m, tick = o["me"], o["match_tick"]
+        hp = m.get("hp")
+        damaged = isinstance(hp,(int,float)) and isinstance(self.last_hp,(int,float)) and hp < self.last_hp
+        current = {t.get("seat"):bool(t.get("alive")) for t in o.get("teammates",[]) if isinstance(t,dict) and t.get("seat") is not None}
+        teammate_lost = any(self.team_alive.get(k,False) and not alive for k,alive in current.items())
+        if damaged or teammate_lost:
+            self.alert_until = tick+180
+            recent = self.last_seen_enemy if 0 <= tick-self.last_seen_tick < 180 else None
+            self.alert_cover = self.nearby_cover([m["x"],m["y"],m["z"]],recent)
+        self.last_hp, self.team_alive = hp, current
+
+    def watch_heading(self, o, site):
+        """Prefer enemy spawn, discount landmark sectors reported as occupied.
+
+        Zones are coarse and do not imply that a teammate covers the angle.
+        Never suppress a visible enemy or a recent threat with this heuristic.
+        """
+        me = o["me"]
+        enemy_side = "attack" if o["side"] == "defend" else "defend"
+        pads = self.spawn_points.get(enemy_side, []) if isinstance(self.spawn_points, dict) else []
+        points = [p for p in pads if isinstance(p, (list, tuple)) and len(p) >= 2
+                  and all(isinstance(v, (int, float)) and math.isfinite(v) for v in p[:2])]
+        candidates = []
+        if points:
+            candidates.append((sum(p[0] for p in points)/len(points),
+                               sum(p[1] for p in points)/len(points), 1.0, None))
+        if isinstance(self.landmarks, dict):
+            for name, pos in self.landmarks.items():
+                if isinstance(pos, (list, tuple)) and len(pos) >= 2 and all(isinstance(v,(int,float)) and math.isfinite(v) for v in pos[:2]):
+                    candidates.append((pos[0], pos[1], 0.5, name))
+        occupied = {t.get("zone") for t in o.get("teammates", []) if isinstance(t,dict) and t.get("alive") and t.get("zone")}
+        occupied_bearings = []
+        for x,y,_,name in candidates:
+            if name in occupied and math.hypot(x-me["x"], y-me["y"]) > 2:
+                occupied_bearings.append(math.atan2(-(y-me["y"]), x-me["x"]))
+        choices = []
+        for x,y,weight,name in candidates:
+            dx,dy=x-me["x"],y-me["y"]
+            if math.hypot(dx,dy)<3: continue
+            heading=math.atan2(-dy,dx)
+            penalty = 0.65 if any(abs(angle(heading-b)) < 0.4 for b in occupied_bearings) else 0
+            choices.append((weight-penalty,heading))
+        if choices:
+            return max(choices,key=lambda item:item[0])[1]
+        dx,dy=me["x"]-site["center"][0],me["y"]-site["center"][1]
+        return math.atan2(-dy,dx) if math.hypot(dx,dy)>0.5 else (o["seat"]%5)*(2*math.pi/5)
+
+    def spawn_center(self, side):
+        pads = self.spawn_points.get(side, []) if isinstance(self.spawn_points,dict) else []
+        pts = [p for p in pads if isinstance(p,(list,tuple)) and len(p)>=2
+               and all(isinstance(v,(int,float)) and math.isfinite(v) for v in p[:2])]
+        return [sum(p[i] for p in pts)/len(pts) for i in (0,1)] if pts else None
+
+    def travel_aim(self, o, pos, waypoint, lookahead):
+        """Face the route ahead; ignore a behind-spawn lookahead early on."""
+        own = self.spawn_center(o["side"])
+        enemy = self.spawn_center("defend" if o["side"] == "attack" else "attack")
+        target = lookahead
+        if own and enemy:
+            spawn_distance = math.dist(own,enemy)
+            own_distance = math.dist(pos[:2],own)
+            early = own_distance < max(12.0, 0.30*spawn_distance) and o["round_tick"] < 1800
+            if early:
+                # A route can start by snapping to a node behind the player.
+                forward = [enemy[0]-own[0], enemy[1]-own[1]]
+                vx,vy = target[0]-pos[0],target[1]-pos[1]
+                if vx*forward[0]+vy*forward[1] < 0:
+                    target = enemy
+        if math.dist(pos[:2],target[:2]) < 0.5:
+            target = waypoint
+        return angle(math.atan2(-(target[1]-pos[1]),target[0]-pos[0])-o["me"]["yaw"])
+
+    def route(self, start, goal, danger=None):
+        if not self.nodes:
+            return [goal]
+        first = min(self.nodes,
+                    key=lambda k: distance(start, self.nodes[k]))
+        last = min(self.nodes,
+                   key=lambda k: distance(goal, self.nodes[k]))
+        # Use physical edge length rather than simply counting graph edges.
+        # Straight-line distance is a lower bound because all added penalties
+        # are nonnegative; A* avoids scanning the entire map on each replan.
+        heuristic = lambda node: distance(self.nodes[node], self.nodes[last])
+        queue, costs, parent = [(heuristic(first), 0, 0.0, first)], {first: 0.0}, {first: None}
+        serial = 0
+        while queue:
+            _, _, cost, here = heapq.heappop(queue)
+            if cost != costs[here]:
+                continue
+            if here == last:
+                break
+            for there in self.edges[here]:
+                edge_length = distance(self.nodes[here], self.nodes[there])
+                # Risk is only a heuristic around this player's recent sighting.
+                # It is not a visibility, cover, or teammate-position model.
+                risk = 0.0
+                if danger is not None:
+                    middle = [(x + y) * 0.5 for x, y in zip(self.nodes[here], self.nodes[there])]
+                    proximity = math.dist(middle[:2], danger[:2])
+                    risk = max(0.0, 1.0 - proximity / 4.0) * 3.0
+                # Prefer an existing navigation edge close to box cover; do not
+                # steer into a wall or assert an occluded line of sight.
+                middle = [(x+y)*0.5 for x,y in zip(self.nodes[here], self.nodes[there])]
+                exposed = bool(self.cover_grid) and not self.near_cover(middle)
+                uncovered = danger is not None and not self.cover_toward(middle, danger)
+                ascent = max(0.0, self.nodes[there][2]-self.nodes[here][2])
+                elevation_cost = 4.0 * max(0.0, ascent-0.6)
+                blocked = (self.blocked_point is not None and
+                           math.dist(self.nodes[there][:2], self.blocked_point[:2]) < 1.5)
+                new_cost = cost + edge_length * (1.0 + risk + (0.20 if exposed else 0.0) + (0.15 if uncovered else 0.0)) + elevation_cost + (15.0 if blocked else 0.0)
+                if new_cost < costs.get(there, float("inf")):
+                    costs[there], parent[there] = new_cost, here
+                    serial += 1
+                    heapq.heappush(queue, (new_cost + heuristic(there), serial, new_cost, there))
+        if last not in parent:
+            return [goal]
+        path, cursor = [goal], last
+        while cursor is not None:
+            path.append(self.nodes[cursor])
+            cursor = parent[cursor]
+        return list(reversed(path))
+
+    def buy(self, o):
+        """Select a round plan using AGX's published catalogue and public score.
+
+        These budgets and seat assignments are experimental, not fitted to CS data.
+        """
+        m, cash = o["me"], o["me"]["cash"]
+        if self.buy_round != o["round_index"]:
+            self.buy_round = o["round_index"]
+            wins, team = o.get("round_wins"), o.get("team")
+            opponent_wins = None
+            if isinstance(wins, (list, tuple)) and len(wins) == 2 and team in (0, 1):
+                opponent_wins = wins[1 - team]
+            elif isinstance(wins, dict) and team in (0, 1):
+                opponent_wins = wins.get(str(1 - team), wins.get(1 - team))
+            target = o.get("win_target", 13)
+            match_point = (isinstance(opponent_wins, (int, float)) and
+                           isinstance(target, (int, float)) and opponent_wins >= target - 1)
+            last_half_round = o["round_index"] in (11, 23)
+            force = match_point or last_half_round
+            rifle = "ak47" if o["side"] == "attack" else "m4a1"
+            rifle_price = 2700 if o["side"] == "attack" else 2900
+            if m["weapons"][0] is not None:
+                self.buy_primary, self.buy_mode = None, "held"
+            elif cash >= 6500 and o["seat"] % 5 == 0:
+                self.buy_primary, self.buy_mode = "awp", "full"
+            elif cash >= rifle_price + 650 or (force and cash >= rifle_price):
+                self.buy_primary, self.buy_mode = rifle, "full"
+            elif cash >= 2200 or (force and cash >= 1400):
+                self.buy_primary = "mac10" if o["side"] == "attack" else "mp9"
+                self.buy_mode = "partial"
+            elif force and cash >= 1050:
+                self.buy_primary, self.buy_mode = "nova", "partial"
+            else:
+                self.buy_primary, self.buy_mode = None, "save"
+        if self.buy_mode == "save":
+            return {}
+        if m["weapons"][0] is None and self.buy_primary:
+            return {"buy": self.buy_primary}
+        if m["armor"] < 50 and cash >= 650:
+            return {"buy": "armor"}
+        if o["side"] == "defend" and not m["has_kit"] and cash >= 400:
+            return {"buy": "defusekit"}
+        kinds = m.get("throwable_kinds", [])
+        if (cash >= 1200 and self.flash_buy_round != o["round_index"]
+                and isinstance(kinds, list) and "flashbang" not in kinds):
+            self.flash_buy_round = o["round_index"]
+            return {"buy": "flashbang"}
+        if (cash >= 1800 and self.smoke_buy_round != o["round_index"]
+                and isinstance(kinds, list) and "smokegrenade" not in kinds):
+            self.smoke_buy_round = o["round_index"]
+            return {"buy": "smokegrenade"}
+        if (cash >= 2400 and self.he_buy_round != o["round_index"]
+                and isinstance(kinds,list) and "hegrenade" not in kinds):
+            self.he_buy_round = o["round_index"]
+            return {"buy": "hegrenade"}
+        return {}
+
+    def defensive_position(self, site, seat):
+        """Pick a nearby nav waypoint near vertical box geometry, when supplied.
+
+        Box-based cover is an approximation; the actual collision mesh and
+        navigation connectivity must still be validated in official matches.
+        """
+        key = (site.get("id"), seat % 2)
+        if key in self.cover_cache:
+            return self.cover_cache[key]
+        center = site["center"]
+        candidates = [p for p in self.nodes.values()
+                      if max(3.0, site.get("radius",4)*0.6) <= math.dist(p[:2], center[:2]) <= 22
+                      and abs(p[2] - center[2]) <= 2.5][:250]
+        boxes = [b for b in self.cover_boxes if isinstance(b, dict)
+                 and all(isinstance(b.get(k), (int, float)) for k in ("x","y","z","w","d","h"))
+                 and abs(b["x"] - center[0]) <= b["w"] / 2 + 24
+                 and abs(b["y"] - center[1]) <= b["d"] / 2 + 24][:100]
+        ranked = []
+        for point in candidates:
+            for b in boxes:
+                # Exclude floor slabs and nodes inside an obstacle's footprint.
+                if not (b["z"] <= point[2] + 0.7 and b["z"] + b["h"] >= point[2] + 1.0):
+                    continue
+                dx = max(abs(point[0] - b["x"]) - b["w"] / 2, 0)
+                dy = max(abs(point[1] - b["y"]) - b["d"] / 2, 0)
+                gap = math.hypot(dx, dy)
+                if 0.4 <= gap <= 3.0:
+                    ranked.append((gap + 0.08 * math.dist(point[:2], center[:2]), point))
+        ranked.sort(key=lambda item: item[0])
+        unique = []
+        for _, point in ranked:
+            if all(math.dist(point[:2], prior[:2]) >= 2.0 for prior in unique):
+                unique.append(point)
+        result = list(unique[seat % min(2, len(unique))]) if unique else list(center)
+        self.cover_cache[key] = result
+        return result
+
+    def weak_defensive_site(self, o, assigned):
+        """Compare observed zone counts and visible enemies; retain ties."""
+        if len(self.sites) < 2:
+            return assigned
+        ids = [site.get("id") for site in self.sites]
+        mates = {sid: 0 for sid in ids}
+        known = 0
+        for t in o.get("teammates", []):
+            if isinstance(t,dict) and t.get("alive") and t.get("zone") in mates:
+                mates[t["zone"]] += 1
+                known += 1
+        if known < 2:
+            self.defense_candidate = None
+            return assigned
+        enemies = {sid: 0 for sid in ids}
+        for enemy in o.get("visible", []):
+            if not isinstance(enemy,dict) or not all(isinstance(enemy.get(k),(int,float)) for k in ("x","y")):
+                continue
+            nearest = min(self.sites, key=lambda site: math.dist([enemy["x"],enemy["y"]],site["center"][:2]))
+            enemies[nearest.get("id")] += 1
+        score = {sid: mates[sid]-enemies[sid] for sid in ids}
+        best = min(self.sites, key=lambda site: score[site.get("id")])
+        candidate = best.get("id") if score[assigned.get("id")] - score[best.get("id")] >= 2 else None
+        if candidate != self.defense_candidate:
+            self.defense_candidate, self.defense_since = candidate, o["match_tick"]
+        if candidate and o["match_tick"]-self.defense_since >= 180:
+            return best
+        return assigned
+
+    def utility_safe(self, o, approach, kind):
+        """Bound obvious risk with approximate map and zone data, not physics."""
+        if kind == "flashbang":
+            return self.flash_safe(o, approach)
+        pos=[o["me"]["x"],o["me"]["y"],o["me"]["z"]]
+        if not self.near_building_corner(pos):
+            return False
+        # Preserve margin against the HE's published blast radius; landing is
+        # still uncertain and must be validated from match events.
+        if kind == "hegrenade" and math.dist(pos[:2], approach[:2]) < 12:
+            return False
+        for t in o.get("teammates",[]):
+            if not isinstance(t,dict) or not t.get("alive"):
+                continue
+            z=t.get("zone"); point=self.landmarks.get(z) if isinstance(self.landmarks,dict) else None
+            if not isinstance(point,(list,tuple)) or len(point)<2 or not all(isinstance(v,(int,float)) and math.isfinite(v) for v in point[:2]):
+                return False
+            if math.dist(point[:2],approach[:2]) < (25 if kind in ("hegrenade","molotov","incgrenade") else 15):
+                return False
+        return True
+
+    def flash_safe(self, o, approach):
+        """Conservative geometry/team-zone gate, not a flash-physics proof.
+
+        AGX supplies no exact teammate locations or grenade trajectory here.
+        Unknown living teammate zones prevent a speculative flash.
+        """
+        m = o["me"]
+        pos = [m["x"],m["y"],m["z"]]
+        if not self.near_building_corner(pos) or not self.cover_toward(pos, approach):
+            return False
+        for teammate in o.get("teammates", []):
+            if not isinstance(teammate, dict) or not teammate.get("alive"):
+                continue
+            zone = teammate.get("zone")
+            landmark = self.landmarks.get(zone) if isinstance(self.landmarks,dict) else None
+            if not isinstance(landmark,(list,tuple)) or len(landmark)<2:
+                return False
+            if not all(isinstance(x,(int,float)) and math.isfinite(x) for x in landmark[:2]):
+                return False
+            # Zones are coarse. Reject any landmark within flash radius plus margin.
+            if math.dist(landmark[:2], approach[:2]) < 40:
+                return False
+        return True
+
+    def flash_avoid(self, o, action):
+        """Turn away during expected flash fuse; does not guarantee occlusion."""
+        m = o["me"]
+        return dict(action, yaw_rate=clip(angle(self.flash_away_yaw-m["yaw"])/0.15),
+                    pitch_rate=clip(-m["pitch"]/0.1), crouch=True)
+
+    def utility_action(self, o, approach=None):
+        """Prime once and release on the following callback if still valid."""
+        m, tick, rid = o["me"], o["match_tick"], o["round_index"]
+        active = m.get("active_slot", 1)
+        if active not in (0, 1, 2):
+            active = 1
+        if self.flash_primed_tick is not None:
+            unsafe = (approach is None or bool(o.get("visible")) or
+                      not self.utility_safe(o, approach, self.utility_kind))
+            if m.get("blind_ticks") or not m.get("alive") or unsafe:
+                self.flash_primed_tick = None
+                kind = self.utility_kind or "flashbang"
+                self.utility_kind = None
+                return {"weapon_slot":active, "throw":kind, "throw_state":"cancel"}
+            self.flash_primed_tick = None
+            self.flash_used_round = rid
+            kind = self.utility_kind or "flashbang"
+            self.utility_kind = None
+            if kind == "flashbang":
+                self.flash_away_yaw = angle(m["yaw"] + math.pi)
+                self.flash_turn_until = tick + 120
+            return {"weapon_slot":active, "throw":kind, "throw_state":"release", "throw_mode":"full"}
+        if self.flash_used_round == rid or m.get("blind_ticks"):
+            return None
+        kinds = m.get("throwable_kinds", [])
+        if not isinstance(kinds, list):
+            return None
+        preferred = ("smokegrenade", "molotov", "incgrenade", "hegrenade", "flashbang") if tick < self.peek_until else ("flashbang",)
+        available = [x for x in preferred if x in kinds]
+        if not available:
+            return None
+        visible = o.get("visible", [])
+        # Do not prime while an opponent can already shoot us.
+        if visible:
+            return None
+        if approach is None or not isinstance(approach, (list,tuple)) or len(approach) < 2:
+            return None
+        dx, dy = approach[0]-m["x"], approach[1]-m["y"]
+        reach = math.hypot(dx,dy)
+        ready_tick = m.get("throw_ready", 0)
+        if not 8 <= reach <= 18 or (isinstance(ready_tick, (int, float)) and ready_tick > tick):
+            return None
+        yaw = angle(math.atan2(-dy, dx) - m["yaw"])
+        if abs(yaw) > 0.20:
+            return None
+        kind = next((x for x in available if self.utility_safe(o, approach, x)), None)
+        if kind is None:
+            return None
+        self.flash_primed_tick = tick
+        self.utility_kind = kind
+        return {"weapon_slot":active, "throw":kind, "throw_state":"prime", "throw_mode":"full"}
+
+    def listen(self, o):
+        """Do not use anonymous sounds; AGX cannot identify their team."""
+        self.sound_yaw, self.sound_tick = None, -10000
+
+    def low_ammo(self, gun):
+        """Experimental magazine thresholds; avoid abandoning a loaded sniper."""
+        if not gun:
+            return True
+        ammo = gun.get("ammo", 0)
+        weapon_id = gun.get("id", "")
+        if weapon_id in ("awp", "ssg08", "nova", "mag7", "sawedoff", "xm1014"):
+            return ammo <= 1
+        return ammo <= 5 if weapon_id not in ("pistol", "usp", "p250", "elite", "deagle", "tec9", "fiveseven") else ammo <= 3
+
+    def objective_urgent(self, o):
+        """Use only public score/fuse data; no assumption of hidden enemy state."""
+        wins, team, target = o.get("round_wins"), o.get("team"), o.get("win_target", 13)
+        opponent = None
+        if isinstance(wins, (list, tuple)) and len(wins) == 2 and team in (0, 1):
+            opponent = wins[1 - team]
+        elif isinstance(wins, dict) and team in (0, 1):
+            opponent = wins.get(str(1-team), wins.get(1-team))
+        match_point = (isinstance(opponent, (int, float)) and
+                       isinstance(target, (int, float)) and opponent >= target-1)
+        bomb = o.get("bomb", {})
+        end = bomb.get("fuse_end_tick")
+        if (o.get("side") == "defend" and bomb.get("state") == "planted"
+                and isinstance(end, (int, float))):
+            duration = bomb.get("defuse_duration")
+            if not isinstance(duration, (int, float)) or duration <= 0:
+                duration = 300 if o["me"].get("has_kit") else 600
+            progress = bomb.get("defuse_progress")
+            if not isinstance(progress, (int, float)):
+                progress = 0
+            urgent_fuse = end - o["match_tick"] <= max(0, duration-progress) + 120
+        else:
+            urgent_fuse = False
+        return match_point or urgent_fuse
+
+    def select_weapon(self, o):
+        """During a threat prefer a loaded pistol over a nearly empty primary."""
+        m = o["me"]
+        primary, secondary = m["weapons"][0], m["weapons"][1]
+        threat = bool(o.get("visible") and not m.get("blind_ticks"))
+        primary_reload = primary.get("reload_until", 0) if primary else 0
+        primary_busy = isinstance(primary_reload, (int, float)) and primary_reload > o["match_tick"]
+        if (threat and primary and (self.low_ammo(primary) or primary_busy)
+                and secondary and secondary.get("ammo", 0) > 0):
+            return 1
+        if primary and (primary.get("ammo", 0) > 0 or primary.get("reserve", 0) > 0):
+            return 0
+        return 1
+
+    def objective_first(self, o):
+        """Prefer engaging a visible enemy with a costly primary unless urgent."""
+        if self.objective_urgent(o):
+            return True
+        m = o["me"]
+        primary = m["weapons"][0]
+        expensive = primary and primary.get("id") in ("awp", "scar20", "m4a1", "m4a4", "ak47", "sg553")
+        usable = any(g and g.get("ammo", 0) > 0 for g in m["weapons"][:2])
+        return not (expensive and usable and o.get("visible") and not m.get("blind_ticks"))
+
+    def target(self, o):
+        """Rank visible enemies by range and our angle to them, not enemy intent."""
+        me = o["me"]
+        def threat(enemy):
+            dx, dy = enemy["x"] - me["x"], enemy["y"] - me["y"]
+            dist = math.hypot(dx, dy)
+            angular_error = abs(angle(math.atan2(-dy, dx) - me["yaw"]))
+            # The direction is our view angle; no enemy-facing data is assumed.
+            score = 1.0 / (3.0 + dist) + 0.04 * (1.0 - angular_error / math.pi)
+            if isinstance(enemy.get("yaw"), (int, float)):
+                towards_me = math.atan2(dy, -dx)
+                facing_error = abs(angle(enemy["yaw"] - towards_me))
+                score += 0.035 * (1.0 - facing_error / math.pi)
+            return score
+        return max(o["visible"], key=threat)
+
+    def choose_site(self, o):
+        """Coordinate via round/seat only; no agent communication is assumed."""
+        if not self.sites:
+            return None
+        base = o["round_index"] % len(self.sites)
+        if o["side"] == "attack":
+            return self.sites[base]  # all attackers use the same initial objective
+        return self.sites[(base + o["seat"] % len(self.sites)) % len(self.sites)]
+
+    def uncovered_site(self, o, assigned):
+        """Rebalance only after a sustained, unambiguous teammate-zone report."""
+        teammates = [t for t in o.get("teammates", []) if isinstance(t, dict) and t.get("alive")]
+        zones = [t.get("zone") for t in teammates]
+        valid = {s.get("id") for s in self.sites}
+        pattern = zones[0] if len(zones) >= 2 and zones[0] in valid and all(z == zones[0] for z in zones) else None
+        tick = o["match_tick"]
+        if pattern != self.zone_pattern:
+            self.zone_pattern, self.zone_since = pattern, tick
+        if pattern and tick - self.zone_since >= 180 and assigned.get("id") == pattern:
+            return next((s for s in self.sites if s.get("id") != pattern), assigned)
+        return assigned
+
+    def near_building_corner(self, pos):
+        """A nearby vertical box corner, not an arbitrary navigation turn."""
+        for b in self.cover_grid.get((math.floor(pos[0]/12), math.floor(pos[1]/12)), ()):
+            if not (b["z"] <= pos[2]+0.7 and b["z"]+b["h"] >= pos[2]+1):
+                continue
+            dx = abs(abs(pos[0]-b["x"]) - b["w"]/2)
+            dy = abs(abs(pos[1]-b["y"]) - b["d"]/2)
+            if math.hypot(dx,dy) <= 2.5:
+                return True
+        return False
+
+    def peek_action(self, o, action):
+        """Brief forward/backward probe before any return to combat."""
+        tick, m = o["match_tick"], o["me"]
+        if tick >= self.peek_until:
+            return None
+        elapsed = tick - self.peek_start
+        direction = 1 if elapsed < 9 and not o.get("visible") else -1
+        if o.get("visible") and elapsed < 9:
+            self.peek_start = tick - 9
+            self.peek_until = tick + 9
+        relative = angle(self.peek_heading - m["yaw"])
+        self.anchor, self.anchor_tick = None, tick
+        return dict(action, move_forward=direction * 0.8 * math.cos(relative),
+                    move_right=-direction * 0.8 * math.sin(relative),
+                    yaw_rate=clip(relative/0.15), walk=False)
+
+    def remember_enemy(self, o):
+        """Keep a short-lived personal sighting, never a teammate's private view."""
+        if o["visible"] and not o["me"]["blind_ticks"]:
+            enemy = self.target(o)
+            self.last_seen_enemy = [enemy["x"], enemy["y"], enemy["z"]]
+            self.last_seen_tick = o["match_tick"]
+
+    def hold(self, o, action, site):
+        """Aim at last threat, coarse sound, or the approach opposite the site."""
+        m, tick = o["me"], o["match_tick"]
+        if self.last_seen_enemy and 0 <= tick - self.last_seen_tick < 180:
+            dx = self.last_seen_enemy[0] - m["x"]
+            dy = self.last_seen_enemy[1] - m["y"]
+            desired = math.atan2(-dy, dx)
+        elif self.sound_yaw is not None and 0 <= tick - self.sound_tick < 45:
+            desired = self.sound_yaw
+        else:
+            desired = self.watch_heading(o, site)
+        action.update(yaw_rate=clip(angle(desired - m["yaw"]) / 0.15),
+                      pitch_rate=clip(-m["pitch"] / 0.1))
+        self.anchor, self.anchor_tick = None, tick
+        return action
+
+    def combat(self, o, action, gun):
+        m = o["me"]
+        enemy = self.target(o)
+        dx, dy = enemy["x"]-m["x"], enemy["y"]-m["y"]
+        heights = {"head": 1.64, "chest": 1.18, "abdomen": 0.88}
+        part = next((p for p in ("chest", "head", "abdomen")
+                     if p in enemy["parts"]), "chest")
+        height = heights[part] * (0.6 if enemy["crouch"] else 1.0)
+        eye = 0.95 if m["crouch"] else 1.62
+        dz = enemy["z"] + height - m["z"] - eye
+        punch = gun.get("aim_punch", {}) if gun else {}
+        yaw = angle(math.atan2(-dy, dx) - m["yaw"]
+                    - 2 * punch.get("yaw", 0.0))
+        pitch = math.atan2(dz, max(0.1, math.hypot(dx, dy)))
+        pitch -= m["pitch"] + 2 * punch.get("pitch", 0.0)
+        reload_until = gun.get("reload_until", 0) if gun else 0
+        ready = bool(gun and gun["ammo"] and
+                     (not isinstance(reload_until, (int, float)) or reload_until <= o["match_tick"]))
+        # Release the trigger between pistol shots.
+        gun_id = gun.get("id") if gun else None
+        semi_auto = action["weapon_slot"] == 1 or gun_id in ("awp", "ssg08", "nova")
+        trigger = not semi_auto or (o["match_tick"] // 3) % 4 == 0
+        scoped = gun_id in ("awp", "ssg08")
+        if scoped:
+            action["zoom_level"] = 1
+            ready = ready and m.get("zoom_level", 0) > 0
+        action.update(yaw_rate=clip(yaw / 0.15),
+                      pitch_rate=clip(pitch / 0.1), crouch=True,
+                      fire=ready and trigger and abs(yaw) < 0.04
+                      and abs(pitch) < 0.04)
+        return action
+
+    def move(self, o, goal, action):
+        m = o["me"]
+        pos = [m["x"], m["y"], m["z"]]
+        tick = o["match_tick"]
+        if tick < self.escape_until:
+            yaw = angle(self.escape_yaw - m["yaw"])
+            return dict(action, move_forward=0.9 * math.cos(yaw),
+                        move_right=-0.9 * math.sin(yaw),
+                        yaw_rate=clip(yaw / 0.15),
+                        pitch_rate=clip(-m["pitch"] / 0.1), walk=False,
+                        jump=bool(m["grounded"] and tick % 30 == 0))
+        recent = (self.last_seen_enemy is not None and
+                  0 <= tick - self.last_seen_tick < 180)
+        risk_stamp = self.last_seen_tick if recent else None
+        if self.blocked_point is not None and tick >= self.blocked_until:
+            self.blocked_point = None
+            self.path = []
+        if self.goal != goal or not self.path or self.path_risk_stamp != risk_stamp:
+            danger = self.last_seen_enemy if recent else None
+            self.path, self.goal = self.route(pos, goal, danger), list(goal)
+            self.path_risk_stamp = risk_stamp
+        # Navmesh samples can be above the actual foot position on a slope.
+        while (len(self.path) > 1 and
+               math.dist(pos[:2], self.path[0][:2]) < 1.0 and
+               abs(pos[2] - self.path[0][2]) < 2.0):
+            self.path.pop(0)
+        point = self.path[0]
+        # Trigger at nearby geometry, independent of navigation turning angle.
+        own_spawn = self.spawn_center(o["side"])
+        near_spawn = own_spawn is not None and math.dist(pos[:2],own_spawn) < 12 and o["round_tick"] < 1800
+        if (not near_spawn and self.near_building_corner(pos) and tick-self.peek_cooldown >= 300
+                and math.dist(pos[:2], point[:2]) > 1.0):
+            self.peek_heading = math.atan2(-(point[1]-pos[1]), point[0]-pos[0])
+            self.peek_start, self.peek_until, self.peek_cooldown = tick, tick+18, tick
+            self.peek_target = [pos[0]+12*math.cos(self.peek_heading),
+                                pos[1]-12*math.sin(self.peek_heading), pos[2]]
+            self.peeked = tuple(point[:3])
+            utility = self.utility_action(o, self.peek_target)
+            if utility is not None:
+                self.peek_start += 3
+                self.peek_until += 3
+                return utility
+            return self.peek_action(o, action)
+        dx, dy = point[0]-pos[0], point[1]-pos[1]
+        yaw = angle(math.atan2(-dy, dx) - m["yaw"])
+        moved = (self.last_position is None
+                 or distance(pos, self.last_position) > 0.01)
+        self.stuck = 0 if moved else self.stuck + 1
+        self.last_position = pos
+        # Move toward the waypoint while looking toward a recent nearby sighting;
+        # absent one, look one waypoint ahead along the current route.
+        aim_point = (self.last_seen_enemy if recent and
+                     math.dist(pos[:2], self.last_seen_enemy[:2]) < 25.0
+                     else self.path[min(1, len(self.path) - 1)])
+        aim_yaw = self.travel_aim(o, pos, point, aim_point) if not recent else angle(math.atan2(-(aim_point[1] - pos[1]), aim_point[0] - pos[0]) - m["yaw"])
+        if not recent and self.sound_yaw is not None and 0 <= tick - self.sound_tick < 45:
+            aim_yaw = angle(self.sound_yaw - m["yaw"])
+        primary = m.get("weapons", [None])[0]
+        valuable = primary and primary.get("id") in ("awp","scar20","m4a1","m4a4","ak47","sg553")
+        enemy_spawn = self.spawn_center("defend" if o["side"] == "attack" else "attack")
+        contested = recent or (enemy_spawn is not None and own_spawn is not None and
+                               math.dist(pos[:2],enemy_spawn) < math.dist(own_spawn,enemy_spawn)*0.65)
+        speed = 0.55 if valuable and contested else 0.75
+        action.update(move_forward=speed * math.cos(yaw),
+                      move_right=-speed * math.sin(yaw),
+                      yaw_rate=clip(aim_yaw / 0.15),
+                      pitch_rate=clip(-m["pitch"] / 0.1), walk=False)
+        if self.anchor is None or math.dist(pos[:2], self.anchor[:2]) > 0.6:
+            self.anchor, self.anchor_tick = pos, tick
+        if tick >= self.escape_until and tick - self.anchor_tick > 60:
+            # Commit to leaving a blocked corner; small sidesteps must not
+            # immediately reset recovery and send us into the same obstacle.
+            self.escapes += 1
+            turn = (1 if (o["seat"] + self.escapes) % 2 else -1)
+            self.escape_yaw = m["yaw"] + turn * (1.2 + 0.4 * (self.escapes % 3))
+            self.escape_until = tick + 45
+            self.blocked_point, self.blocked_until = list(point), tick + 600
+            self.anchor, self.anchor_tick = pos, self.escape_until
+            self.path = []
+        if tick < self.escape_until:
+            yaw = angle(self.escape_yaw - m["yaw"])
+            action.update(move_forward=0.9 * math.cos(yaw),
+                          move_right=-0.9 * math.sin(yaw),
+                          yaw_rate=clip(yaw / 0.15),
+                          jump=bool(m["grounded"] and tick % 30 == 0))
+        elif point[2] - pos[2] > 0.45 and math.hypot(dx, dy) < 1.8:
+            action["jump"] = bool(m["grounded"] and tick % 24 == 0)
+        return action
+
+    def act(self, o):
+        if "map" in o:
+            self.pending_map = o["map"]
+        # The opening observation is large. Build the navigation graph on a
+        # later buy callback so JSON decoding and graph work use separate budgets.
+        if self.pending_map is not None and ("map" not in o or o["phase"] == "live"):
+            self.load_map(self.pending_map)
+            self.pending_map = None
+        if self.round != o["round_index"]:
+            self.round = o["round_index"]
+            self.path, self.goal = [], None
+            self.path_risk_stamp = None
+            self.last_position, self.stuck = None, 0
+            self.anchor, self.anchor_tick = None, 0
+            self.escape_until, self.escapes = 0, 0
+            self.last_seen_enemy, self.last_seen_tick = None, -10000
+            self.sound_yaw, self.sound_tick = None, -10000
+            self.flash_primed_tick = None
+            self.peek_until, self.peek_target, self.peeked = 0, None, None
+            self.last_hp, self.team_alive = None, {}
+            self.alert_until, self.alert_cover = 0, None
+            self.zone_pattern, self.zone_since = None, 0
+            self.peek_start, self.peek_heading, self.peek_cooldown = 0, 0.0, -10000
+            self.utility_kind = None
+            self.blocked_point, self.blocked_until = None, 0
+            self.postplant_goal, self.postplant_since = None, 0
+            self.flash_turn_until, self.flash_away_yaw = 0, 0.0
+            self.escort_goal, self.escort_tick = None, -10000
+            self.defense_candidate, self.defense_since = None, 0
+        m = o["me"]
+        if not m["alive"] or o["phase"] not in ("buy", "live"):
+            return {}
+        if o["phase"] == "buy":
+            return self.buy(o)
+        slot = self.select_weapon(o)
+        gun = m["weapons"][slot]
+        action = {"weapon_slot": slot}
+        active_slot = m.get("active_slot", slot)
+        switching = active_slot != slot
+        threat = bool(o["visible"] and not m["blind_ticks"])
+        reload_until = gun.get("reload_until", 0) if gun else 0
+        is_reloading = isinstance(reload_until, (int, float)) and reload_until > o["match_tick"]
+        # Reload early only when threats are not visible; wait until the selected
+        # weapon is active so switching and reloading do not conflict.
+        if (not threat and not switching and gun and self.low_ammo(gun)
+                and gun.get("reserve", 0) > 0 and not is_reloading):
+            action["reload"] = True
+        pos = [m["x"], m["y"], m["z"]]
+        bomb = o["bomb"]
+        site = self.choose_site(o)
+        # The opening observation can arrive before the graph is prepared.
+        if site is None:
+            return action
+        # A known planted or dropped bomb overrides the scheduled site.
+        bomb_state = bomb.get("state")
+        planted = bomb_state == "planted"
+        bomb_position = bomb.get("position")
+        known_position = isinstance(bomb_position,(list,tuple)) and len(bomb_position) >= 3
+        if o["side"] == "defend" and planted and not known_position and bomb.get("site"):
+            site = next((x for x in self.sites if x.get("id") == bomb["site"]),site)
+        elif o["side"] == "defend" and not planted and not known_position:
+            site = self.weak_defensive_site(o, site)
+        goal = list(site["center"])
+        if known_position and (planted or bomb_state == "world" or
+                               (o["side"] == "defend" and bomb_state == "held")):
+            goal = list(bomb_position)
+        escorting = (o["side"] == "attack" and bomb_state == "held" and
+                     known_position and not m.get("carrying_bomb"))
+        if escorting:
+            if (self.escort_goal is None or
+                (o["match_tick"]-self.escort_tick >= 45 and math.dist(self.escort_goal[:2],bomb_position[:2]) >= 4)):
+                self.escort_goal, self.escort_tick = list(bomb_position), o["match_tick"]
+            goal = self.escort_goal
+
+        self.remember_enemy(o)
+        self.listen(o)
+        self.update_alert(o)
+        can_fight = bool(threat and gun and gun.get("ammo", 0) > 0
+                         and not is_reloading)
+        # Objective interaction takes priority. Returning only the current
+        # slot avoids issuing reload, fire, or an unnecessary weapon switch.
+        active = m.get("active_slot", slot)
+        if active not in (0, 1, 2):
+            active = slot
+        objective_action = {"weapon_slot": active}
+        if self.objective_first(o):
+            if o["side"] == "defend" and planted and known_position and distance(pos, goal) < 2.7:
+                if self.flash_primed_tick is not None:
+                    self.flash_primed_tick = None
+                    kind = self.utility_kind or "flashbang"
+                    self.utility_kind = None
+                    return dict(objective_action, throw=kind, throw_state="cancel")
+                return dict(objective_action, use="defuse")
+            if (m["carrying_bomb"] and bomb["state"] != "planted"
+                    and distance(pos, site["center"]) < site["radius"] * 0.5):
+                if self.flash_primed_tick is not None:
+                    self.flash_primed_tick = None
+                    kind = self.utility_kind or "flashbang"
+                    self.utility_kind = None
+                    return dict(objective_action, throw=kind, throw_state="cancel")
+                return dict(objective_action, use="plant")
+        # A dropped bomb is picked up automatically by the engine when close
+        # enough and in line of sight; do not send its id as an item pickup id.
+        approach = goal if (o["side"] == "attack" and bomb_state == "held") else None
+        if (o["side"] == "defend" and self.sound_yaw is not None and
+                0 <= o["match_tick"] - self.sound_tick < 45):
+            # A coarse sound can also be friendly; this is an experimental cue.
+            approach = [m["x"] + 12 * math.cos(self.sound_yaw),
+                        m["y"] - 12 * math.sin(self.sound_yaw), m["z"]]
+        if self.peek_until > o["match_tick"] and not threat:
+            approach = self.peek_target
+        utility = self.utility_action(o, approach)
+        if utility is not None:
+            if o["match_tick"] < self.peek_until:
+                self.peek_start += 3
+                self.peek_until += 3
+            return utility
+        if o["match_tick"] < self.flash_turn_until and not threat and not self.objective_urgent(o):
+            return self.flash_avoid(o, action)
+        if o["match_tick"] < self.peek_until:
+            peek = self.peek_action(o, action)
+            if peek is not None:
+                return peek
+        if can_fight:
+            if switching:
+                return action  # switching consumes time; engage on a later callback
+            return self.combat(o, action, gun)
+
+        if escorting and math.dist(pos[:2], bomb_position[:2]) <= 5:
+            return self.hold(o, action, site)
+
+        # Once an enemy drops the bomb, guard the known location rather than
+        # continuing to hold an unrelated assigned site. Never invent a location.
+        guarding_drop = o["side"] == "defend" and bomb_state == "world" and known_position
+        if guarding_drop:
+            if math.dist(pos[:2], goal[:2]) <= 7:
+                return self.hold(o, action, {"center":goal})
+        elif o["side"] == "defend" and not planted and not (known_position and bomb_state == "held"):
+            goal = self.defensive_position(site, o["seat"])
+            if distance(pos, goal) < 1.5 and (o["match_tick"] >= self.alert_until or not self.alert_cover):
+                return self.hold(o, action, site)
+        elif o["side"] == "attack" and planted and known_position and distance(pos, goal) < 12:
+            if self.postplant_goal is None or o["match_tick"] - self.postplant_since > 1200:
+                candidate = self.nearby_cover(pos, goal)
+                self.postplant_goal = candidate if candidate and math.dist(candidate[:2],goal[:2]) <= 16 else list(pos)
+                self.postplant_since = o["match_tick"]
+            if distance(pos, self.postplant_goal) > 1.5:
+                return self.move(o, self.postplant_goal, action)
+            return self.hold(o, action, {"center":goal})
+
+        # Respond to damage or a newly observed teammate death using only local
+        # information; pressing an urgent bomb objective has priority above.
+        if (not threat and o["match_tick"] < self.alert_until and self.alert_cover
+                and not self.objective_urgent(o) and not guarding_drop
+                and not m.get("carrying_bomb") and bomb_state not in ("world", "planted")):
+            if distance(pos, self.alert_cover) > 1.5:
+                return self.move(o, self.alert_cover, action)
+            return self.hold(o, action, site)
+
+        # Stagger the departure, but avoid waiting 6–12 seconds at the spawn.
+        if not planted and o["round_tick"] < (o["seat"] % 5) * 12:
+            return action
+        return self.move(o, goal, action)
+
+
+_player = Player()
+
+
+def init(context):
+    global _player
+    # Observations and this policy use acyclic containers; reference counting
+    # releases them without repeatedly scanning the large public map.
+    gc.disable()
+    _player = Player()
+
+
+def act(observation):
+    return _player.act(observation)
